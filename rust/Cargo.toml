@@ -1,0 +1,29 @@
+[package]
+name = "ski-creche"
+version = "0.2.0"
+edition = "2024"
+description = "Weight-tied local learning with progressive depth growth"
+license = "MIT"
+
+[dependencies]
+burn = { version = "0.20", features = ["wgpu", "autodiff", "train"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+rand = "0.8"
+
+[[example]]
+name = "basic"
+path = "examples/basic.rs"
+
+[[example]]
+name = "elastic_depth"
+path = "examples/elastic_depth.rs"
+
+[[example]]
+name = "vram_compare"
+path = "examples/vram_compare.rs"
+
+[[example]]
+name = "elastic_width"
+path = "examples/elastic_width.rs"
