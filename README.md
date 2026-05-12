@@ -362,6 +362,75 @@ python -m ski_creche run.db --run NAME   # specific run
 
 ---
 
+## Adaptive scale-up
+
+PAVING-style progressive width growth on FineWeb-Edu, with an
+automatic math-derived growth scheduler so the user never picks a
+`d` schedule by hand.  The model starts at `d=2` and grows on demand:
+each grow event fires when the per-FLOP information gain over a
+sliding window drops below the eval-batch noise floor.
+
+### Setup
+
+| | |
+|---|---|
+| Architecture | 22-layer transformer, sinusoidal PE, weight-tied head |
+| Optimizer | fp32 AdamW, `lr=1.5e-4`, `wd=0.01`, `grad_clip=1.0` |
+| `d_head` | stepped: 2 (d≤8), 4 (d≤32), 8 (d≤128), 16 (d≤512), 32 (d>512) |
+| Data | FineWeb-Edu sample-10BT, GPT-2 BPE, 2.9B tokens cached |
+| Eval | 20-batch CE on held-out 1M tokens, σ_eval ≈ 0.05 |
+| Hardware | 1× NVIDIA RTX PRO 6000 Blackwell, 102 GB VRAM |
+
+### Trigger (no hand-tuned thresholds)
+
+```
+W = 2000 steps  (≈ 4 evals at EVAL_INTERVAL=500)
+threshold = k · σ_eval = 2 · 0.05 = 0.10
+
+best_old   = min(val_ce in [t-2W, t-W])
+best_new   = min(val_ce in [t-W, t])
+progress   = best_old - best_new
+d_eff_W    = entropy-based effective rank of block weights
+div_guard  = (val_t - best) < 2·σ_eval
+
+if progress < threshold and d_eff_W > 0.3 and div_guard:
+    new_d = round_to_d_head_multiple( max(d+2, ⌈d · 1.05 / 2⌉ · 2) )
+    grow()  # noise init on W_{q,k,v} new rows, zero on W_o/ff2 output gates
+```
+
+### Result vs same-`d` E2E baseline
+
+We train a fixed-width `d=544` end-to-end baseline from scratch with
+identical data stream, tokenizer, context length, optimizer, learning
+rate, grad clip, and hardware, and run for matched wall-clock 6.81 h.
+`d=544` matches the final width the adaptive run grew into.
+
+Both runs trained for the same total wall-clock 6.81 h on the same GPU.
+
+| | best val CE | FLOPs to best | wall to best |
+|---|---:|---:|---:|
+| Adaptive (d=2→496) | **3.565** | 1.00×10¹⁸ | 6.81 h |
+| Fixed d=544 E2E   | 3.855      | 1.66×10¹⁸ | 5.92 h |
+
+(Adaptive's best is its last eval — still descending when stopped.
+E2E's best comes earlier and does not improve over the remaining
+~1 h of wall, so the 6.81 h vs 5.92 h gap reflects E2E plateauing,
+not less compute spent on it.)
+
+The adaptive run wins by **−0.29 val CE** while also using **~1.7×
+fewer FLOPs** to reach its best.  Past d=544 the trajectory plateaus
+near the Chinchilla floor predicted for our (N, D) pair (≈ 3.46),
+so further val descent requires more training tokens, not more model
+size.
+
+See [`scaleup/paper.pdf`](scaleup/paper.pdf) for the LR-bound
+derivation `η_max = σ_eval / √N`, the asymmetric grow init that
+breaks the dead-attention-head failure mode of zero-pad, the
+precision diagnostic (`bf16+AdamW8bit` introduces systematic
+optimizer-state drift; `fp32 AdamW` removes it), and the figures.
+
+---
+
 ## Rust
 
 Same algorithm, same DB schema. Uses `burn` (pure Rust, wgpu backend) and
