@@ -397,15 +397,28 @@ of Hoffmann \emph{et al.}'s scaling law: at $d{=}544$ ($N \approx
 and our best $3.565$ is within $0.10$ of that floor.  Further val
 descent requires more training tokens, not more parameters.
 
-\paragraph{Wall-clock throughput at small $d$.}
+\paragraph{Wall-clock throughput at small $d$, and choosing the start
+$d$.}
 The adaptive run averages $\approx 41$ TFLOP/s wall throughput on
 RTX 6000 Blackwell vs the fixed-$d{=}544$ baseline's $\approx 78$
 TFLOP/s on the same GPU; the deficit is from the small-$d$ phase,
 where each per-step matmul is below the kernel-launch break-even.
-The adaptive run still wins on both wall-clock and FLOP-to-best because
-the time spent at small $d$ buys a much better starting point at
-$d{=}544$, but the throughput penalty caps the FLOP-to-best advantage
-at $\sim 1.7\times$ in our setup.
+A complementary run starting at $d{=}64$ (skipping the
+$d \in [2, 32]$ phase) is more wall-efficient but less FLOP-efficient
+at every val target we measured: e.g.\ to reach $4.84$, $d{=}2$-start
+needs $4.2 \times 10^{16}$ FLOPs in $97$\,min while $d{=}64$-start
+needs $8.1 \times 10^{16}$ FLOPs in $65$\,min ($1.5{\times}$ wall
+faster, $0.5{\times}$ FLOP-efficient).  The Chinchilla justification
+follows: at small training-token count $D$, the optimal model size
+$N \propto D / 20$ is itself small, and the time-to-first-meaningful-
+$d$ is genuinely useful work --- not waste.  Modeling
+$T_{\text{step}}(d) \approx T_{\text{launch}} + c \cdot d^2 \cdot L$
+and FLOPs/step $\propto d^2$, the wall-optimal start $d_{\text{sweet}}$
+solves $T_{\text{launch}} = c \cdot d^2 \cdot L$ (compute equals
+launch overhead).  For our setup this is $d \approx 16$-$32$.  We
+recommend choosing the start $d$ along this trade-off: start near
+$d_{\text{sweet}}$ if wall-clock is the cost; start at $d{=}2$ if
+total FLOPs is.
 
 \paragraph{Stability past $d \approx 66$.}
 Beyond the best checkpoint at $d=66$ the val curve drifts upward by
