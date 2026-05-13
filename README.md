@@ -405,17 +405,22 @@ identical data stream, tokenizer, context length, optimizer, learning
 rate, grad clip, and hardware, and run for matched wall-clock 6.81 h.
 `d=544` matches the final width the adaptive run grew into.
 
-Both runs trained for the same total wall-clock 6.81 h on the same GPU.
+All runs trained for the same total wall-clock 6.81 h on the same GPU.
 
 | | best val CE | FLOPs to best | wall to best |
 |---|---:|---:|---:|
-| Adaptive (d=2→496) | **3.565** | 1.00×10¹⁸ | 6.81 h |
-| Fixed d=544 E2E   | 3.855      | 1.66×10¹⁸ | 5.92 h |
+| Adaptive start d=2 (grow to 496) | **3.565** | 1.00×10¹⁸ | 6.81 h |
+| Adaptive start d=64 (grow to 496) | 3.628    | 1.20×10¹⁸ | 6.51 h |
+| Fixed d=544 E2E (no growth)       | 3.855    | 1.66×10¹⁸ | 5.92 h |
 
-(Adaptive's best is its last eval — still descending when stopped.
-E2E's best comes earlier and does not improve over the remaining
-~1 h of wall, so the 6.81 h vs 5.92 h gap reflects E2E plateauing,
-not less compute spent on it.)
+Starting from d=2 wins both FLOPs-to-best and wall-clock-to-best.
+Two effects: (i) Chinchilla-optimal N(D) ≈ D/20 keeps the d=2 trajectory
+near the per-FLOP-loss frontier throughout, while d=64 is over-
+parameterised for its early D and pays a warmup cost; (ii) PAVING grow
+zero-pads each new dim, so dim 0 trains for the whole run but dim 480
+only for the final thousand steps — starting at d=2 trains the early
+dims an order of magnitude longer, giving a strong basis for later
+dims to stack on.
 
 The adaptive run wins by **−0.29 val CE** while also using **~1.7×
 fewer FLOPs** to reach its best.  Past d=544 the trajectory plateaus
