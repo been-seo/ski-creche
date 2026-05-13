@@ -32,24 +32,26 @@ A FLOP-Efficient Schedule for Snowman Language Models}
 \maketitle
 
 \begin{abstract}
-A Snowman language model trained with PAVING-style local backprop, grown
-adaptively from $d=2$ in 22 layers, reaches a FineWeb-Edu validation
-cross-entropy of $3.565$ at $d{=}496$ using $6.81$ wall-hours on a
-single RTX PRO 6000 Blackwell, vs $3.855$ from a fixed-width $d{=}544$
-E2E baseline run at matched wall-clock $6.81$h on the same hardware.
-At matched-wall, the adaptive curve wins by $-0.29$ in val CE while
-also using $\approx 1.7\times$ fewer FLOPs
-($1.0{\times}10^{18}$ vs $1.66{\times}10^{18}$).  We describe the math-derived growth schedule
-(window-based progress test, entropy-based effective rank, divergence
-guard; no hand-tuned thresholds) and report four supporting
+We grow a 22-layer Snowman language model adaptively from $d{=}2$ on
+FineWeb-Edu, using a math-derived schedule with no hand-tuned
+thresholds (window-based progress test against the eval-batch noise
+floor, entropy-based effective rank of the weight matrices, and a
+divergence guard).  On a single RTX PRO 6000 Blackwell, the adaptive
+run reaches validation cross-entropy $3.565$ at $d{=}496$ in $6.81$
+wall-hours, using $1.0{\times}10^{18}$ FLOPs.  A fixed-$d{=}544$
+end-to-end baseline trained from scratch with identical data,
+tokenizer, optimizer, and learning rate, run for matched wall-clock
+on the same GPU, reaches only $3.855$ at $1.66{\times}10^{18}$ FLOPs.
+The adaptive run wins by $-0.29$ val CE and uses $\sim 1.7{\times}$
+fewer FLOPs to its best.  We additionally report four supporting
 contributions: (i) the asymmetric weight initialization that breaks
 the dead-attention-head failure mode of zero-pad growth, (ii) a
-learning-rate bound $\eta_{\max} = \sigma_{\text{eval}}/\sqrt{N}$ that
-explains why $\eta = 3{\times}10^{-4}$ destabilizes training at small
-post-grow widths, (iii) a precision diagnostic showing
-\texttt{bf16+AdamW8bit} introduces systematic optimizer-state drift
-which \texttt{fp32 AdamW} removes at the same $\eta$, and (iv) a
-stepped $d_{\text{head}}(d)$ schedule that keeps the number of
+$\sqrt{N}$ scaling argument $\eta_{\max} \sim \sigma_{\text{eval}} /
+\sqrt{N}$ that explains why $\eta = 3{\times}10^{-4}$ destabilizes
+training at small post-grow widths, (iii) a precision diagnostic
+showing \texttt{bf16+AdamW8bit} introduces systematic optimizer-state
+drift which \texttt{fp32 AdamW} removes at the same $\eta$, and (iv)
+a stepped $d_{\text{head}}(d)$ schedule that keeps the number of
 attention heads bounded ($\le 16$) and removes the linear-in-$d$
 attention-memory term from the small-$d_{\text{head}}$ PAVING start.
 \end{abstract}
@@ -301,17 +303,19 @@ useful content is the $\sqrt{N}$ direction: as the model grows, the
 admissible $\eta$ must shrink.
 
 For our $d=46$ configuration with 22 layers (the post-grow state of
-the main run): $N \approx 3.2\times 10^{6}$ (the embedding alone is
-$2.3{\times}10^6$ parameters), $\sigma_{\text{eval}} \approx 0.05$,
-giving $\eta_{\max} \approx 2.8\times 10^{-5}$ from
-Eq.~\ref{eq:lr-bound} but $\eta_{\max} \approx 6{\times}10^{-4}$
-after the empirical $\|g\|_1/\|g\|_2$ correction --- consistent with
-the sweet spot $\mathrm{LR}/2 = 1.5\times 10^{-4}$ that the
-diagnostic sweep at fixed $d{=}46$
-(Appendix~\ref{app:lr-sweep}) identifies as best (val $4.84$ at the
-end of the sweep window; $\mathrm{LR}=3\times 10^{-4}$ drifts
-upward, $\mathrm{LR}/3$ shows occasional gradient spikes,
-$\mathrm{LR}/30$ is too small to make timely progress).
+an early diagnostic run): $N \approx 3.2\times 10^{6}$ (the embedding
+alone is $2.3{\times}10^6$ parameters), $\sigma_{\text{eval}} \approx
+0.05$.  Eq.~\ref{eq:lr-bound} as written gives
+$\eta_{\max} \approx 2.8\times 10^{-5}$, which is too conservative;
+the empirical $\|g\|_1/\|g\|_2 \approx 86$ (vs $\sqrt{N} \approx
+1700$) brings the admissible $\eta$ up to $\approx 6{\times}10^{-4}$.
+The LR-sweep diagnostic at fixed $d{=}46$ (Appendix~\ref{app:lr-sweep})
+identifies $\mathrm{LR}/2 = 1.5{\times}10^{-4}$ as the sweet spot
+(best val $5.03$ at the end of the sweep window) and shows that
+$\mathrm{LR}=3{\times}10^{-4}$ drifts upward, $\mathrm{LR}/3$ shows
+occasional gradient spikes, and $\mathrm{LR}/30$ is too small to make
+timely progress.  Our main run uses $\eta = 1.5{\times}10^{-4}$
+throughout.
 
 \subsection{Stepped $d_{\text{head}}$ schedule}
 \label{sec:dhead}
@@ -344,24 +348,22 @@ $\approx 0.5$ GB in \texttt{fp32}, $0.25$ GB in \texttt{bf16}).
 $d_{\text{head}}$ bracket, the new $d_{\text{new}}$ is rounded up to
 the nearest multiple of the new $d_{\text{head}}$
 (\S\ref{sec:asymmetric-init}) so that
-$n_{\text{heads}}^{\text{new}} = d_{\text{new}}/d_{\text{head}}^{\text{new}}$
-is integer.  Weight matrices $W_q, W_k, W_v, W_o$ are
-\emph{stored} as $(d, d)$ Linears; the head decomposition is purely
-a \texttt{view} for the per-head reshape inside the attention
-forward pass.  Doubling $d_{\text{head}}$ therefore changes only the
-\emph{view} stride, not the stored weights: a column previously
-interpreted as the last entry of head $k$ becomes the first entry
-of head $\lfloor k/2 \rfloor$'s second half.  This re-partitioning
-is not function-preserving (the softmax-over-head-index splits
-differ), but the new $d$-columns produced by the grow are
-zero-padded with the asymmetric init of
-\S\ref{sec:asymmetric-init}, so the perturbation is the same kind
-of one-time shock as a regular grow event.  We treat the
-$d_{\text{head}}$ transition step as one extra grow event:
+$n_{\text{heads}}^{\text{new}} = d_{\text{new}} /
+d_{\text{head}}^{\text{new}}$ is integer.  $W_q, W_k, W_v, W_o$ are
+stored as $(d, d)$ Linears; the head decomposition is purely a
+\texttt{view} for the per-head reshape inside the attention forward
+pass.  When $d_{\text{head}}$ doubles, the stored weights do not
+change, but two adjacent old heads $\{2k, 2k+1\}$ are now reshaped
+into a single new head $k$ (their $d_{\text{head}}$ columns are
+concatenated).  This re-partitioning is not function-preserving:
+the per-head softmax now combines two attention patterns that were
+previously separate.  The perturbation is the same kind of one-time
+shock as a regular grow event (the new $d$-columns produced by the
+grow are zero-padded with the asymmetric init of
+\S\ref{sec:asymmetric-init}), and we treat it identically:
 $\texttt{in\_recovery}$ is set for $W$ steps and the divergence
-guard is \emph{not} reset (best-so-far is preserved across
-transitions, since the function shock typically pushes val above
-best).  Up to $d{=}2048$ there are at most four such transitions
+guard's best-so-far is preserved across the transition.  Up to
+$d{=}2048$ there are at most four such transitions
 ($d_{\text{head}}{:}\,2{\to}4{\to}8{\to}16{\to}32$), contributing
 $\le 4$ recovery windows of $\sim 4000$ steps each --- negligible
 compared with total training.
@@ -430,6 +432,55 @@ floor predicted for our $(N, D)$, so we do not expect further
 substantial descent without more data.  The full per-$d$ trajectory
 is in Appendix~\ref{app:trajectory}.
 
+\subsection{Start-$d$ ablation}
+\label{sec:startd-ablation}
+
+We rerun the adaptive trajectory with starting width $d{=}64$
+(skipping $d \in [2, 32]$) to test whether the small-$d$ phase is
+``wasted compute''.  Both adaptive runs share data stream, tokenizer,
+context length, eval batch, optimizer, learning rate, grad clip, and
+$d_{\text{head}}$ schedule; the only change is the starting $d$.
+Best checkpoints at matched wall-clock $6.81$h:
+
+\begin{center}
+\begin{tabular}{lrrr}
+\toprule
+ & best val CE & FLOPs to best & wall to best \\
+\midrule
+Adaptive start $d{=}2$    & \textbf{3.565} & $1.00 \times 10^{18}$ & $6.81$ h \\
+Adaptive start $d{=}64$   & 3.628          & $1.20 \times 10^{18}$ & $6.51$ h \\
+Fixed $d{=}544$ E2E       & 3.855          & $1.66 \times 10^{18}$ & $5.92$ h \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Starting from $d{=}2$ wins both metrics.  This is initially
+surprising --- the small-$d$ phase has poor GPU utilization (matmuls
+fall below the kernel-launch break-even) and feels like wasted
+compute.  Two effects explain why it still wins.
+
+(i) \emph{Chinchilla-optimal $N(D) \approx D/20$.}  At low token
+counts $D$ the optimal model size is itself small; growing from
+$d{=}2$ stays near the per-FLOP-loss frontier throughout, while
+$d{=}64$ from scratch is over-parameterised for its early $D$ and
+pays a flat warmup cost before benefiting from its capacity.
+
+(ii) \emph{Width-dimension curriculum.}  PAVING-style grow with
+zero-pad init means each dimension's training time depends on
+\emph{when} it was added: dims $0$--$1$ are trained for the entire
+run, dims $400$--$496$ only for the final few thousand steps.
+Starting from $d{=}2$ gives the first dims an order of magnitude
+more updates than starting from $d{=}64$ would, and these
+well-trained early dims serve as a strong basis on top of which
+later dims are stacked.  Cold-starting all $64$ dimensions
+simultaneously skips this curriculum.
+
+The wall-time penalty of the small-$d$ phase is real but is more
+than offset by these two effects in our setup.  We have not searched
+for the wall-optimal start $d$; we expect a sweet spot somewhere
+between $2$ and $64$ for hardware where kernel-launch overhead
+dominates more than ours.
+
 \subsection{Width Detach --- Numerical Verification}
 
 We rerun the proof script \texttt{proofs/width\_detach.py} at
@@ -446,8 +497,9 @@ per-$g$ values.
 \item Net2Net-style clone-grow init in place of zero-pad, to test
   whether the lower $d_{\text{eff}}{=}0.5$ observed mid-trajectory is
   the dominant inefficiency.
-\item A start-$d$ sweep ($d \in \{2, 16, 60, 128\}$) to verify the
-  $N(F) \propto F^{0.46}$ optimal-schedule prediction.
+\item A finer start-$d$ sweep around the wall-optimal sweet spot
+  ($d \in \{8, 16, 32, 48\}$) to identify the kernel-launch
+  break-even on our hardware.
 \end{itemize}
 
 \section{Limitations}
@@ -459,52 +511,6 @@ of Hoffmann \emph{et al.}'s scaling law: at $d{=}544$ ($N \approx
 105$M, $20$ tokens/param) the predicted loss floor is $\approx 3.46$,
 and our best $3.565$ is within $0.10$ of that floor.  Further val
 descent requires more training tokens, not more parameters.
-
-\paragraph{Start-$d$ ablation.}
-We rerun the adaptive trajectory with starting width $d{=}64$
-(skipping $d \in [2, 32]$) to test whether the small-$d$ phase is
-``wasted compute''.  Both runs share data stream, tokenizer, context
-length, eval batch, optimizer, learning rate, grad clip, and
-$d_{\text{head}}$ schedule; the only change is the starting $d$.
-Best checkpoints at matched wall-clock:
-
-\begin{center}
-\begin{tabular}{lrrr}
-\toprule
- & best val CE & FLOPs to best & wall to best \\
-\midrule
-Adaptive start $d{=}2$    & \textbf{3.565} & $1.00 \times 10^{18}$ & $6.81$ h \\
-Adaptive start $d{=}64$   & 3.628          & $1.20 \times 10^{18}$ & $6.51$ h \\
-Fixed $d{=}544$ E2E       & 3.855          & $1.66 \times 10^{18}$ & $5.92$ h \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-\textbf{Starting from $d{=}2$ wins both metrics.}  This is initially
-surprising --- the small-$d$ phase has poor GPU utilization (matmuls
-fall below the kernel-launch break-even) and feels like wasted compute.
-Two effects explain why it still wins:
-
-(i) Chinchilla-optimal $N(D) \approx D / 20$.  At low token counts $D$
-the optimal model size is itself small; growing from $d{=}2$ stays
-near the per-FLOP-loss frontier throughout, while $d{=}64$ from
-scratch is over-parameterised for its early $D$ and pays a flat
-warmup cost before benefiting from its capacity.
-
-(ii) Width-dimension curriculum.  PAVING-style grow with zero-pad init
-means each dimension's training time depends on \emph{when} it was
-added: dims $0$-$1$ are trained for the entire run, dims $400$-$496$
-only for the final few thousand steps.  Starting from $d{=}2$ gives
-the first dims an order of magnitude more updates than starting from
-$d{=}64$ would, and these well-trained early dims serve as a strong
-basis on top of which later dims are stacked.  Cold-starting all
-$64$ dimensions simultaneously skips this curriculum.
-
-The wall-time penalty of the small-$d$ phase is real but is more
-than offset by these two effects in our setup.  We have not searched
-for the wall-optimal start $d$; we expect a sweet spot somewhere
-between $2$ and $64$ for hardware where kernel-launch overhead
-dominates more than ours.
 
 \paragraph{Stability past $d \approx 66$ (early diagnostic).}
 An earlier configuration of this run (\texttt{bf16+AdamW8bit},
@@ -563,13 +569,15 @@ architecture at the same final width under matched wall-clock.
 
 \section{Related Work and Discussion}
 
-We do not catalog progressive training broadly; the closest line is Net2Net
-function-preserving width growth and stage-wise training of mixture-of-depths
-or progressive-stack transformers.  PAVING differs by (i) deriving the
-per-FLOP efficiency upper bound directly from the weight-tied $K$-block
-construction and (ii) providing an exact width-elastic LayerNorm.  Our
-contribution is empirical: a single-run demonstration that the prediction
-holds under a serious FLOP budget on real text data, with a schedule that
+We do not catalog progressive training broadly; the closest line is
+Net2Net function-preserving width growth and stage-wise training of
+mixture-of-depths or progressive-stack transformers.  PAVING differs
+by (i) deriving the per-FLOP efficiency upper bound directly from the
+weight-tied $K$-block construction and (ii) providing an exact
+width-elastic LayerNorm.  Our contribution is empirical: a
+single-run demonstration that the prediction holds at the
+$10^{18}$-FLOP scale on real text data (FineWeb-Edu, $2.9$B tokens,
+22 layers, $d$ grown from $2$ to $544$), with a schedule that
 requires no hand-tuned thresholds.
 
 The natural follow-up is more training tokens (the current run is
@@ -628,14 +636,12 @@ precision & best val & behavior \\
 \end{tabular}
 \end{center}
 
-The bound from Eq.~\ref{eq:lr-bound} predicts
-$\eta_{\max} \approx 2.8{\times}10^{-5} \approx \eta_0/11$ if the
-worst-case Cauchy--Schwarz inequality is tight.  In practice it is far
-from tight ($\|g\|_1 \approx 86 \|g\|_2$ measured, vs $\sqrt{N} \approx
-1700$), so the binding constraint is closer to the precision-bias
-estimate above.  Both rows of the second table use the same $\eta$; the
-only change is the optimizer/forward precision, and that change alone
-removes the drift.
+The sweet spot in the LR sweep is $\eta_0/2$ (best val $5.03$); see
+\S\ref{sec:lr-bound} for the $\sqrt{N}$-scaling argument and the
+gap from the worst-case bound.  In the precision toggle, both rows
+use the same $\eta = 3{\times}10^{-4}$; the only change is the
+optimizer / forward precision, and that change alone removes the
+drift.
 
 \section{Hyperparameters}
 \label{app:hyperparams}
