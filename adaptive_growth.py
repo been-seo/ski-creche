@@ -1,10 +1,16 @@
 """
-Adaptive Progressive E2E (v3, mathematically derived):
-  - Trigger: |best_W_ago - best_now| < k·σ_eval over window W
-    (per-FLOP info gain falls below noise floor → grow)
-  - Growth: d → max(d+2, ceil(d·α/2)*2)  (multiplicative, even-rounded)
-  - Recovery = window W (after grow, no trigger check for W steps)
-FLOP budget matched to E2E fixed (d=2048, 22L, 25000 steps).
+Adaptive progressive width growth for Snowman language models, with a
+math-derived trigger.  See paper/paper.tex for the full derivation.
+
+  - Trigger: best progress in window W < k·σ_eval → grow.
+  - Growth:  d_new = round_to_next_d_head(max(d+2, ceil(d·α/2)*2)).
+  - Recovery: W steps after grow with no trigger check.
+  - Init:    asymmetric — noise on new rows of W_{q,k,v} and ff1;
+             zero on new output rows of W_o and ff2 (the gates).
+  - Stepped d_head(d) so n_heads stays bounded at 16.
+
+Environment variables (all optional):
+  CACHE_PATH, DB_PATH, CKPT_DIR, RUN_NAME, START_D.
 """
 import math, os, queue, sqlite3, threading, time, argparse
 import torch, torch.nn as nn, torch.nn.functional as F
@@ -55,8 +61,12 @@ EVAL_INTERVAL = 500
 EVAL_BATCHES = 20
 LOG_INTERVAL = 100
 
-# FLOP budget
-TARGET_FLOPS = 6 * (V * 2048 + N_LAYERS * 12 * 2048 * 2048) * BATCH * SEQ_LEN * 25000
+# FLOP reference for the per-step FLOP% log line (display only — not used
+# in any decision).  Default: a fictitious d=2048, 22L, 25 000-step run;
+# override with TARGET_FLOPS env var if you want a different reference.
+TARGET_FLOPS = float(os.environ.get(
+    'TARGET_FLOPS',
+    6 * (V * 2048 + N_LAYERS * 12 * 2048 * 2048) * BATCH * SEQ_LEN * 25000))
 
 def flops_per_step(d):
     return 6 * (V * d + N_LAYERS * 12 * d * d) * BATCH * SEQ_LEN
@@ -312,7 +322,8 @@ def main():
         best = ckpt.get('best', float('inf'))
         print(f'  Resumed: step={global_step}, d={ckpt["d"]}, flops={flops_used:.2e}')
     else:
-        model = Model(2, N_LAYERS, SEQ_LEN).to(DEVICE)
+        start_d = int(os.environ.get('START_D', 2))
+        model = Model(start_d, N_LAYERS, SEQ_LEN).to(DEVICE)
         global_step = 0
         flops_used = 0
         best = float('inf')

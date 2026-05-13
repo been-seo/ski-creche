@@ -595,26 +595,6 @@ summary, the main run touches $d \in \{2, 4, 6, 8, \ldots, 64, 72,
 $d_{\text{head}}$-aware rule of \S\ref{sec:asymmetric-init}, and
 reaches its best val $3.565$ at $d{=}496$ after $6.81$ wall-hours.
 
-\section{E2E baseline was not at plateau}
-\label{app:e2e-not-plateau}
-\begin{center}
-\begin{tabular}{rrl}
-\toprule
-step bucket & E2E best val & $\Delta$ \\
-\midrule
-0--5\,000     & 6.82 & --- \\
-5\,000--10\,000   & 6.26 & $-0.56$ \\
-10\,000--15\,000  & 5.76 & $-0.50$ \\
-15\,000--20\,000  & 5.39 & $-0.37$ \\
-20\,000--25\,000  & 4.97 & $-0.42$ \\
-\bottomrule
-\end{tabular}
-\end{center}
-The bucket-best is descending at $\Delta \approx -0.4$ in the final
-$5000$-step bucket; the run was stopped at this point.  Extrapolating
-naively, a converged baseline would reach a noticeably lower val; this is
-why we report only the FLOP-efficiency claim.
-
 \section{LR and precision sweep at fixed $d=46$}
 \label{app:lr-sweep}
 Resumed from the main run's $d=46$ checkpoint (step $115\,000$,
