@@ -428,7 +428,7 @@ near the Chinchilla floor predicted for our (N, D) pair (≈ 3.46),
 so further val descent requires more training tokens, not more model
 size.
 
-See [`scaleup/paper.pdf`](scaleup/paper.pdf) for the LR-bound
+See [`paper/paper.pdf`](paper/paper.pdf) for the LR-bound
 derivation `η_max = σ_eval / √N`, the asymmetric grow init that
 breaks the dead-attention-head failure mode of zero-pad, the
 precision diagnostic (`bf16+AdamW8bit` introduces systematic
