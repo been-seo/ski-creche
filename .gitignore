@@ -1,0 +1,5 @@
+paper/paper.aux
+paper/paper.log
+paper/paper.out
+*.db
+__pycache__/

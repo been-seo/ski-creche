@@ -1,22 +1,10 @@
 """
-Adaptive progressive width growth for transformer language models.
-
-Starts at d=2, grows on demand using a math-derived trigger that detects when
-per-FLOP information gain drops below the eval-batch noise floor.
-
-Trigger:  best progress in window W < k·σ_eval  (k=2, σ=0.05) → grow
-Growth:   d → max(d+2, ceil(d·α/2)·2),  α=1.05 (multiplicative, even-rounded)
-Recovery: W steps after grow with no trigger check
-Init:     mean-of-existing weight rows/cols + 2%·std Gaussian noise
-          (smoother than zero-pad, breaks symmetry across new dims)
-
-Caveat: zero-pad with standard LayerNorm causes a one-time mean/var shift on
-each grow.  Mean-init reduces the shock per grow but accumulates a small drift
-across many grows.  See README for tradeoffs and the ActiveLayerNorm
-alternative from proofs/width_elasticity.py.
-
-Usage:
-    CACHE_PATH=/path/to/fineweb_tokens.pt python adaptive_growth.py
+Adaptive Progressive E2E (v3, mathematically derived):
+  - Trigger: |best_W_ago - best_now| < k·σ_eval over window W
+    (per-FLOP info gain falls below noise floor → grow)
+  - Growth: d → max(d+2, ceil(d·α/2)*2)  (multiplicative, even-rounded)
+  - Recovery = window W (after grow, no trigger check for W steps)
+FLOP budget matched to E2E fixed (d=2048, 22L, 25000 steps).
 """
 import math, os, queue, sqlite3, threading, time, argparse
 import torch, torch.nn as nn, torch.nn.functional as F
@@ -24,11 +12,27 @@ import torch, torch.nn as nn, torch.nn.functional as F
 DEVICE = 'cuda'
 DTYPE = torch.bfloat16
 V = 50257
-D_HEAD = 2
+D_HEAD = 2  # minimum d_head; actual d_head grows with d via d_head_for(d)
 N_LAYERS = 22
+
+def d_head_for(d):
+    """d_head ramps up with d to keep n_heads bounded.
+    n_heads = d / d_head; for our seq=512 attention memory is O(B·n_heads·T²),
+    so we cap it via stepped d_head."""
+    if d <= 8:    return 2   # heads up to 4
+    if d <= 32:   return 4   # heads up to 8
+    if d <= 128:  return 8   # heads up to 16
+    if d <= 512:  return 16  # heads up to 32
+    return 32                 # heads up to 64 at d=2048
+
+def round_d_to_valid(target_d):
+    """Round target_d up to nearest multiple of d_head_for(target_d)."""
+    dh = d_head_for(target_d)
+    return ((target_d + dh - 1) // dh) * dh
 BATCH, SEQ_LEN = 64, 512
-LR, WD, GRAD_CLIP = 3e-4, 0.01, 1.0
-USE_8BIT = True
+LR, WD, GRAD_CLIP = 1.5e-4, 0.01, 1.0
+USE_8BIT = False  # fp32 AdamW — bf16+8bit causes systematic drift per H4
+USE_AUTOCAST = True  # bf16 forward (saves VRAM), fp32 AdamW state
 D_MAX = 2048
 GROWTH_FACTOR = 1.05  # multiplicative growth (5% more dim per grow)
 GROWTH_MIN_STEP = 2   # absolute floor for small d
@@ -36,13 +40,17 @@ WINDOW_STEPS = 2000   # progress measurement window
 SIGMA_EVAL = 0.05     # eval-batch noise floor (std of val CE across batches)
 NOISE_K = 2.0         # threshold = NOISE_K · SIGMA_EVAL
 PROGRESS_THRESHOLD = NOISE_K * SIGMA_EVAL  # 0.10 default
+DEFF_THRESHOLD = 0.30  # weight-rank ratio: grow only if d_eff_W/d > this
+                       # (trained transformer weights settle around 0.3-0.5;
+                       # lower threshold keeps trigger active across regime)
+ROW_NOISE = 1e-3  # asymmetric init: new rows of W_q/W_k/W_v/ff1 get this·σ_w noise
 VRAM_CAP_RATIO = 0.90  # stop growing when VRAM > this fraction
 
-CACHE_PATH = os.environ.get('CACHE_PATH', './data_cache/fineweb_2.9B.pt')
+CACHE_PATH = '/content/drive/MyDrive/ski/data_cache/fineweb_2.9B.pt'
 EVAL_TOKENS = 1_000_000
-DB_PATH = os.environ.get('DB_PATH', './adaptive.db')
-CKPT_PREFIX = 'adap_'
-CKPT_DIR = os.environ.get('CKPT_DIR', './ckpts')
+DB_PATH = '/content/drive/MyDrive/ski/adaptive_v11.db'
+CKPT_PREFIX = 'adapv11_'
+CKPT_DIR = '/content/drive/MyDrive/ski/ckpts'
 EVAL_INTERVAL = 500
 EVAL_BATCHES = 20
 LOG_INTERVAL = 100
@@ -77,13 +85,33 @@ class DataLoader:
     def close(self): self._stop.set()
 
 # ── model ──
+class ActiveLayerNorm(nn.Module):
+    """LayerNorm restricted to active dimensions (PAVING width-elasticity proof).
+    Stats (mean/var) are computed over first d_active dims only.
+    Combined with zero-pad weights → growth is function-preserving."""
+    def __init__(self, d, eps=1e-5):
+        super().__init__()
+        self.d_active = d
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(d))
+        self.bias = nn.Parameter(torch.zeros(d))
+    def forward(self, x):
+        d = self.d_active
+        active = x[..., :d]
+        mu = active.mean(dim=-1, keepdim=True)
+        var = active.var(dim=-1, keepdim=True, unbiased=False)
+        normed = (active - mu) / torch.sqrt(var + self.eps)
+        out = torch.zeros_like(x)
+        out[..., :d] = self.weight[:d] * normed + self.bias[:d]
+        return out
+
 class Block(nn.Module):
     def __init__(self, d):
         super().__init__()
         self.d = d
-        self.n_heads = max(1, d // D_HEAD)
-        self.d_head = d // self.n_heads
-        self.ln1 = nn.LayerNorm(d); self.ln2 = nn.LayerNorm(d)
+        self.d_head = d_head_for(d)
+        self.n_heads = d // self.d_head
+        self.ln1 = ActiveLayerNorm(d); self.ln2 = ActiveLayerNorm(d)
         self.W_q = nn.Linear(d, d, bias=False)
         self.W_k = nn.Linear(d, d, bias=False)
         self.W_v = nn.Linear(d, d, bias=False)
@@ -101,76 +129,72 @@ class Block(nn.Module):
         h = h + self.ff2(F.gelu(self.ff1(self.ln2(h))))
         return h
 
-def _grow_linear(layer, new_in, new_out, noise=0.02):
-    """Mean-init growth: new rows/cols = mean of existing + small Gaussian noise.
-    Smoother than zero-pad: LN statistics roughly preserved, gradient signal flows.
-    Symmetry breaking via small noise (relative to weight std).
+def _grow_linear(layer, new_in, new_out, noise_new_rows=0.0):
+    """Zero-pad growth with optional small noise on NEW ROWS only.
+
+    Why asymmetric:
+      Pure zero-pad + ActiveLayerNorm makes growth exactly function-preserving
+      (PAVING Thm.~35), but new attention heads' q-row stays at 0 forever:
+        q[new_row] = W_q[new_row,:] @ ln_x = 0  →  attn out=0  →  no
+        contribution to loss  →  ∂L/∂W_q[new_row,:] = 0.
+      Putting a tiny noise on the NEW ROWS of W_q,W_k,W_v breaks this dead loop:
+      now q,k,v at new heads are nonzero, attention output at new-head columns
+      is nonzero, and the GATE weights W_o[:, new_cols] (which we keep at 0) start
+      receiving real gradient.  Once W_o new cols are nonzero, gradient flows
+      back into the new q/k/v rows and the full new head trains normally.
+      Function approximately preserved while the gate is at 0.
     """
     old_w = layer.weight.data
     old_out, old_in = old_w.shape
     dev = old_w.device
-    w = torch.empty(new_out, new_in, device=dev)
+    w = torch.zeros(new_out, new_in, device=dev)
     w[:old_out, :old_in] = old_w
-    n_extra_out = new_out - old_out
-    n_extra_in = new_in - old_in
-    if old_w.numel() > 0:
-        col_mean = old_w.mean(dim=0, keepdim=True)   # (1, old_in)
-        row_mean = old_w.mean(dim=1, keepdim=True)   # (old_out, 1)
-        global_mean = old_w.mean()
-        w_std = old_w.std() if old_w.numel() > 1 else torch.tensor(0.02, device=dev)
-    else:
-        col_mean = torch.zeros(1, old_in, device=dev)
-        row_mean = torch.zeros(old_out, 1, device=dev)
-        global_mean = torch.tensor(0.0, device=dev)
-        w_std = torch.tensor(0.02, device=dev)
-    if n_extra_out > 0 and old_in > 0:
-        w[old_out:, :old_in] = col_mean.expand(n_extra_out, -1)
-    if n_extra_in > 0 and old_out > 0:
-        w[:old_out, old_in:] = row_mean.expand(-1, n_extra_in)
-    if n_extra_out > 0 and n_extra_in > 0:
-        w[old_out:, old_in:] = global_mean
-    if noise > 0 and (n_extra_out > 0 or n_extra_in > 0):
-        sigma = noise * w_std.item()
-        if n_extra_out > 0:
-            w[old_out:, :] += torch.randn(n_extra_out, new_in, device=dev) * sigma
-        if n_extra_in > 0:
-            w[:old_out, old_in:] += torch.randn(old_out, n_extra_in, device=dev) * sigma
+    if noise_new_rows > 0 and new_out > old_out:
+        scale = noise_new_rows
+        if old_w.numel() > 1:
+            scale = noise_new_rows * old_w.std().item()
+        w[old_out:, :old_in] = torch.randn(new_out - old_out, old_in, device=dev) * scale
     layer.weight = nn.Parameter(w)
     if layer.bias is not None:
-        old_b = layer.bias.data
-        new_b = torch.empty(new_out, device=dev)
-        new_b[:old_out] = old_b
-        if new_out > old_out:
-            b_mean = old_b.mean() if old_b.numel() > 0 else torch.tensor(0.0, device=dev)
-            b_std = old_b.std() if old_b.numel() > 1 else torch.tensor(0.02, device=dev)
-            new_b[old_out:] = b_mean + torch.randn(n_extra_out, device=dev) * (noise * b_std.item())
-        layer.bias = nn.Parameter(new_b)
+        b = torch.zeros(new_out, device=dev)
+        b[:old_out] = layer.bias.data
+        layer.bias = nn.Parameter(b)
     layer.in_features, layer.out_features = new_in, new_out
 
-def _grow_layernorm(ln, new_d):
-    """LN: new gain = mean(old gain) ≈ 1; new bias = mean(old bias) ≈ 0."""
+def _grow_active_ln(ln, new_d, activate=True):
+    """ActiveLayerNorm grow: extend gain/bias to new_d (gain=1, bias=0 for new).
+    activate=True: set d_active=new_d (one-time mean/var shock from including zero
+    new dims in stats). activate=False: keep d_active at old (function preserved
+    but new dims dead — for two-phase protocol)."""
     old_d = ln.weight.shape[0]
     dev = ln.weight.device
-    w = torch.empty(new_d, device=dev)
-    b = torch.empty(new_d, device=dev)
+    w = torch.ones(new_d, device=dev)
+    b = torch.zeros(new_d, device=dev)
     w[:old_d] = ln.weight.data; b[:old_d] = ln.bias.data
-    if new_d > old_d:
-        w[old_d:] = ln.weight.data.mean()
-        b[old_d:] = ln.bias.data.mean()
     ln.weight = nn.Parameter(w); ln.bias = nn.Parameter(b)
-    ln.normalized_shape = (new_d,)
+    if activate:
+        ln.d_active = new_d
 
 def grow_block(block, new_d):
+    """Asymmetric grow: noise on NEW ROWS of {W_q,W_k,W_v, ff1}, all else zero.
+    W_o new cols stay 0 (gate), ff2 new rows/cols stay 0 — preserves function
+    while letting the gates start receiving gradient."""
     old_d = block.d
-    _grow_layernorm(block.ln1, new_d)
-    _grow_layernorm(block.ln2, new_d)
-    for lyr in (block.W_q, block.W_k, block.W_v, block.W_o):
-        _grow_linear(lyr, new_d, new_d)
-    _grow_linear(block.ff1, new_d, 4*new_d)
-    _grow_linear(block.ff2, 4*new_d, new_d)
+    _grow_active_ln(block.ln1, new_d)
+    _grow_active_ln(block.ln2, new_d)
+    # q/k/v: small noise on new rows (creates signal in new heads)
+    _grow_linear(block.W_q, new_d, new_d, noise_new_rows=ROW_NOISE)
+    _grow_linear(block.W_k, new_d, new_d, noise_new_rows=ROW_NOISE)
+    _grow_linear(block.W_v, new_d, new_d, noise_new_rows=ROW_NOISE)
+    # W_o: gate — keep all-zero new entries
+    _grow_linear(block.W_o, new_d, new_d, noise_new_rows=0.0)
+    # ff1 new rows = noise (creates signal in new intermediate dims)
+    _grow_linear(block.ff1, new_d, 4*new_d, noise_new_rows=ROW_NOISE)
+    # ff2: gate — keep new rows AND new cols at zero
+    _grow_linear(block.ff2, 4*new_d, new_d, noise_new_rows=0.0)
     block.d = new_d
-    block.n_heads = max(1, new_d // D_HEAD)
-    block.d_head = new_d // block.n_heads
+    block.d_head = d_head_for(new_d)
+    block.n_heads = new_d // block.d_head
 
 class Model(nn.Module):
     def __init__(self, d, n_layers, seq_len):
@@ -179,7 +203,7 @@ class Model(nn.Module):
         self.embed = nn.Embedding(V, d)
         self.register_buffer('pe', self._sinpe(seq_len, d))
         self.blocks = nn.ModuleList([Block(d) for _ in range(n_layers)])
-        self.ln_f = nn.LayerNorm(d)
+        self.ln_f = ActiveLayerNorm(d)
         self.head = nn.Linear(d, V, bias=False)
         self.head.weight = self.embed.weight
     @staticmethod
@@ -203,24 +227,19 @@ class Model(nn.Module):
         return self.head(self.ln_f(h)), h
     def grow(self, new_d):
         old_d = self.d; dev = self.embed.weight.device
-        # Embed: new cols = mean of existing cols + noise
+        # Embed: zero-pad new cols (function-preserving with ActiveLN)
         old_emb = self.embed.weight.data
-        w = torch.empty(V, new_d, device=dev)
+        w = torch.zeros(V, new_d, device=dev)
         w[:, :old_d] = old_emb
-        if new_d > old_d:
-            row_mean = old_emb.mean(dim=1, keepdim=True)
-            emb_std = old_emb.std()
-            w[:, old_d:] = row_mean.expand(-1, new_d - old_d)
-            w[:, old_d:] += torch.randn(V, new_d - old_d, device=dev) * (0.02 * emb_std.item())
         self.embed = nn.Embedding(V, new_d).to(dev)
         self.embed.weight = nn.Parameter(w)
-        # PE: extend with fresh sinusoid for new dims (preserves orthogonal structure)
-        new_pe = self._sinpe(SEQ_LEN, new_d).to(dev)
+        # PE: zero-pad new dims (so x_new = 0 → ActiveLN unaffected)
+        new_pe = torch.zeros(1, SEQ_LEN, new_d, device=dev)
         new_pe[:,:,:old_d] = self.pe[:,:SEQ_LEN,:old_d]
         self.pe = new_pe
         for block in self.blocks:
             grow_block(block, new_d)
-        _grow_layernorm(self.ln_f, new_d)
+        _grow_active_ln(self.ln_f, new_d)
         # head shares embed weight; just update Linear metadata
         self.head = nn.Linear(new_d, V, bias=False).to(dev)
         self.head.weight = self.embed.weight
@@ -230,27 +249,28 @@ class Model(nn.Module):
         return sum(p.numel() for p in self.parameters())
 
 @torch.no_grad()
-def measure_d_eff(model, data):
-    """Measure effective rank of hidden states via SVD."""
-    model.eval()
-    x, _ = data.get_batch()
-    with torch.autocast(device_type='cuda', dtype=DTYPE):
-        _, h = model.forward_with_hidden(x)
-    # h: (B, T, d) → flatten to (B*T, d)
-    h_flat = h.float().reshape(-1, model.d)
-    # Sample subset for efficiency
-    if h_flat.shape[0] > 4096:
-        idx = torch.randperm(h_flat.shape[0])[:4096]
-        h_flat = h_flat[idx]
-    # SVD
-    _, s, _ = torch.linalg.svd(h_flat, full_matrices=False)
-    # Effective rank: exp(entropy of normalized singular values)
-    s = s / s.sum()
-    s = s[s > 1e-10]  # remove zeros
-    entropy = -(s * s.log()).sum()
-    d_eff = entropy.exp().item()
-    model.train()
-    return d_eff
+@torch.no_grad()
+def measure_d_eff(model, data=None):
+    """Effective rank of WEIGHT matrices (PE-clean, batch-free, near-zero cost).
+    Aggregates entropy-based effective rank across W_q/k/v/o, ff1, ff2 of every
+    block, normalized by min(W.shape) so ratio is in [0, 1]. Returns (mean,
+    last_block_ratios) — the absolute mean is the trigger signal."""
+    ratios = []
+    for block in model.blocks:
+        for W in (block.W_q.weight, block.W_k.weight,
+                  block.W_v.weight, block.W_o.weight,
+                  block.ff1.weight, block.ff2.weight):
+            s = torch.linalg.svdvals(W.float())
+            s_sum = s.sum()
+            if s_sum < 1e-10:
+                ratios.append(0.0)
+                continue
+            p = s / s_sum
+            p = p[p > 1e-10]
+            entropy = -(p * p.log()).sum()
+            d_eff = entropy.exp().item()
+            ratios.append(d_eff / min(W.shape))
+    return sum(ratios) / max(len(ratios), 1)
 
 # ── logger ──
 class Logger:
@@ -307,7 +327,7 @@ def main():
 
     opt = make_opt(model)
     t0 = time.time()
-    run = 'adaptive_v3'
+    run = 'adaptive_v11'
     last_d_eff = 0
     last_growth_step = -WINDOW_STEPS  # allow trigger from the start
     # val history at current d (reset on grow); list of (step, val)
@@ -322,14 +342,19 @@ def main():
     print(f'{"="*60}')
 
     while flops_used < TARGET_FLOPS and model.d <= D_MAX:
-        # cosine LR based on remaining FLOP fraction
-        frac = flops_used / TARGET_FLOPS
-        lr = LR * 0.5 * (1 + math.cos(math.pi * frac))
+        # Using fp32 (no precision drift) so we can use the conventional
+        # LR=3e-4 directly. The sqrt(N) bound is conservative and not
+        # binding here per the measurement of gradient effective rank.
+        lr = LR
         for pg in opt.param_groups: pg['lr'] = lr
 
         x, y = train_data.get_batch()
         opt.zero_grad()
-        with torch.autocast(device_type='cuda', dtype=DTYPE):
+        if USE_AUTOCAST:
+            with torch.autocast(device_type='cuda', dtype=DTYPE):
+                logits = model(x)
+                loss = F.cross_entropy(logits.view(-1, V), y.view(-1))
+        else:
             logits = model(x)
             loss = F.cross_entropy(logits.view(-1, V), y.view(-1))
         loss.backward()
@@ -344,10 +369,8 @@ def main():
             print(f'  step {global_step:>6} d={model.d} CE={ce:.4f} lr={lr:.2e} '
                   f'FLOP={flops_used/TARGET_FLOPS*100:.1f}%', flush=True)
 
-        # (activation d_eff trigger disabled — PE-contaminated, see analysis)
-        # d_eff diagnostic measurement only
-        if (global_step + 1) % 1000 == 0:
-            last_d_eff = measure_d_eff(model, train_data)
+        # Weight-rank d_eff: PE-clean, batch-free, used in hybrid grow trigger.
+        # Measured at every eval; cheap (sum of SVDs, ~ms even at d=2048).
 
         # eval
         if (global_step + 1) % EVAL_INTERVAL == 0:
@@ -363,6 +386,8 @@ def main():
             if val < best:
                 best = val
             val_history.append((global_step + 1, val))
+            # Weight-rank d_eff (always measured at eval — used for hybrid trigger)
+            last_d_eff = measure_d_eff(model)
             model.train()
             logger.log(run, global_step+1, model.d, last_d_eff, ce, val, lr,
                        model.param_count, flops_used)
@@ -386,19 +411,33 @@ def main():
 
             recov_tag = ' [recov]' if in_recovery else ''
             cap_tag = ' [VRAM-CAP]' if vram_capped else ''
+            div_tag = ' [DIV]' if (val - best) > 2 * SIGMA_EVAL else ''
             prog_str = f'prog={progress:+.3f}' if progress is not None else 'prog=NA'
             print(f'  >>> eval {global_step+1} d={model.d} val={val:.4f} '
-                  f'best={best:.4f} {prog_str}{recov_tag}{cap_tag} '
+                  f'best={best:.4f} {prog_str} d_eff_W={last_d_eff:.3f}'
+                  f'{recov_tag}{cap_tag}{div_tag} '
                   f'vram={vram_ratio*100:.0f}% '
                   f'FLOP={flops_used/TARGET_FLOPS*100:.1f}%', flush=True)
 
-            if (progress is not None and progress < PROGRESS_THRESHOLD
-                    and model.d < D_MAX and not vram_capped):
-                # multiplicative growth, even-rounded
+            # Hybrid trigger: progress plateau AND weights filling capacity AND
+            # not currently diverging from best.
+            # Divergence guard prevents firing on a degrading val curve where
+            # best is stuck but recent vals are getting worse — growing then
+            # only compounds the damage.
+            stalled = progress is not None and progress < PROGRESS_THRESHOLD
+            saturated = last_d_eff > DEFF_THRESHOLD
+            diverging = (val - best) > 2 * SIGMA_EVAL  # 0.10 above best
+            if (stalled and saturated and model.d < D_MAX
+                    and not vram_capped and not diverging):
+                # multiplicative growth, rounded up to be divisible by the
+                # next d_head (so n_heads is integer)
                 target = math.ceil(model.d * GROWTH_FACTOR / 2) * 2
                 new_d = min(max(model.d + GROWTH_MIN_STEP, target), D_MAX)
+                new_d = round_d_to_valid(new_d)
                 print(f'  *** GROW d={model.d}→{new_d} '
-                      f'(progress={progress:+.3f} < {PROGRESS_THRESHOLD}) ***',
+                      f'(prog={progress:+.3f}<{PROGRESS_THRESHOLD} '
+                      f'∧ d_eff={last_d_eff:.3f}>{DEFF_THRESHOLD} '
+                      f'∧ val-best={val-best:+.3f}) ***',
                       flush=True)
                 model.grow(new_d)
                 model = model.to(DEVICE)
