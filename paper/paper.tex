@@ -128,8 +128,18 @@ The per-FLOP loss decrease at width $d$ is upper-bounded by
 $O(\deff / d^2)$ when $d > \deff$.
 \end{theorem}
 
-Theorem~3 is the empirical lever pulled in this work: while $d > \deff$,
-shrinking $d$ (or starting small) gives a \emph{quadratic} per-FLOP win.
+Theorem~3 is an upper bound: it states the per-FLOP loss decrease at
+width $d$ \emph{cannot exceed} $O(\deff / d^2)$ when $d > \deff$.  It
+does not by itself guarantee that any optimizer achieves this rate.
+The motivational reading is one-sided: at large $d$ with $d \gg
+\deff$, the per-FLOP ceiling is low (so per-FLOP progress \emph{must}
+be slow regardless of optimizer); at small $d$ just above $\deff$,
+the per-FLOP ceiling is high (so there is room for progress, though
+not guaranteed).  Our empirical contribution is the observation that,
+under a standard AdamW optimizer and the trigger of \S\ref{sec:trigger},
+the small-$d$ trajectories \emph{do} make progress close to the
+ceiling --- which is what motivates growing $d$ on demand rather than
+starting at the eventual target width.
 
 \section{Method}
 \label{sec:method}
@@ -244,14 +254,19 @@ FineWeb-Edu (\textsc{sample-10BT}) tokenized with the GPT-2 BPE into a
 2.9B-token cache; first 2.899B for train, last 1M held out for eval.
 Hardware: a single NVIDIA RTX PRO 6000 Blackwell (102 GB).
 
-\subsection{Learning Rate Bound}
+\subsection{Learning Rate Scaling}
 \label{sec:lr-bound}
 
-The value $\eta = 3{\times}10^{-4}$ is conventional for transformer training
-\citep{adam}; we derive here why it is too large for the small-$d$ regime in
-which a growing model spends most of its budget, and why our empirical
-``$\eta/10$ is the sweet spot'' finding (\S\ref{sec:limitations}) is the
-predicted one.
+The value $\eta = 3{\times}10^{-4}$ is conventional for transformer
+training \citep{adam}; we derive here a \emph{motivational scaling}
+that explains why it is too large for the small-$d$ regime in which
+a growing model spends most of its budget, and predicts the empirical
+sweet spot $\eta_{\text{best}} \approx \mathrm{LR}/2$ that our main
+run uses ($\eta = 1.5{\times}10^{-4}$, \S\ref{sec:results}).  The
+inequality below is a Cauchy--Schwarz worst case, not a tight bound;
+it correctly predicts the direction and order of magnitude but is
+$\sim 20{\times}$ conservative in the constant, as the diagnostic in
+Appendix~\ref{app:lr-sweep} documents.
 
 In the AdamW steady state the per-coordinate update is approximately
 $\Delta\theta_i \approx -\eta\cdot\mathrm{sign}(g_i)$, so the first-order
@@ -266,25 +281,37 @@ of model parameters; combined with our gradient clip $\|g\|_2 \le 1$,
 \begin{equation}
 |\Delta L| \;\le\; \eta\,\sqrt{N}.
 \end{equation}
-For a window-based plateau test to function, this single-step loss change
-must be smaller than the eval-batch noise floor $\sigma_{\text{eval}}$ ---
-otherwise the trigger fires on noise rather than on saturation.  Inverting
-the bound:
+For a window-based plateau test to function, single-step loss changes
+should not exceed the eval-batch noise floor $\sigma_{\text{eval}}$
+by much --- otherwise the trigger fires on optimization noise rather
+than on saturation.  Equating the worst-case single-step bound to
+$\sigma_{\text{eval}}$ gives a \emph{scaling}
 \begin{equation}
-\boxed{\;\eta_{\max} \;=\; \frac{\sigma_{\text{eval}}}{\sqrt{N}}.\;}
+\eta_{\max} \;\sim\; \frac{\sigma_{\text{eval}}}{\sqrt{N}}.
 \label{eq:lr-bound}
 \end{equation}
+Two caveats.  First, the comparison of a single-step training
+$\Delta L$ to a validation $\sigma_{\text{eval}}$ is an order-of-
+magnitude argument, not a rigorous bound.  Second, the
+Cauchy--Schwarz step $\|g\|_1 \le \sqrt{N} \|g\|_2$ is loose:
+empirically $\|g\|_1 / \|g\|_2 \approx 86$ at $d{=}46$ while
+$\sqrt{N} \approx 1700$, so Eq.~\ref{eq:lr-bound} is $\sim 20{\times}$
+conservative in the constant (Appendix~\ref{app:lr-sweep}).  The
+useful content is the $\sqrt{N}$ direction: as the model grows, the
+admissible $\eta$ must shrink.
 
-For our $d=46$ configuration with 22 layers (the post-grow state of the
-main run): $N \approx 3.2\times 10^{6}$ (the embedding alone is $2.3{\times}
-10^6$ parameters), $\sigma_{\text{eval}} \approx 0.05$, giving
-$\eta_{\max} \approx 2.8 \times 10^{-5}$, i.e.\ approximately
-$\mathrm{LR}/11$ of the conventional value.  The diagnostic sweep at fixed
-$d=46$ in Appendix~\ref{app:lr-sweep} hits its best validation loss
-($4.84{\to}5.03$) at $\mathrm{LR}/2$ to $\mathrm{LR}/10$, consistent with
-Eq.~\ref{eq:lr-bound}; runs at $\mathrm{LR}=3{\times}10^{-4}$ drift upward,
-runs at $\mathrm{LR}/3$ show occasional gradient spikes, and
-$\mathrm{LR}/30$ is too small to make timely progress.
+For our $d=46$ configuration with 22 layers (the post-grow state of
+the main run): $N \approx 3.2\times 10^{6}$ (the embedding alone is
+$2.3{\times}10^6$ parameters), $\sigma_{\text{eval}} \approx 0.05$,
+giving $\eta_{\max} \approx 2.8\times 10^{-5}$ from
+Eq.~\ref{eq:lr-bound} but $\eta_{\max} \approx 6{\times}10^{-4}$
+after the empirical $\|g\|_1/\|g\|_2$ correction --- consistent with
+the sweet spot $\mathrm{LR}/2 = 1.5\times 10^{-4}$ that the
+diagnostic sweep at fixed $d{=}46$
+(Appendix~\ref{app:lr-sweep}) identifies as best (val $4.84$ at the
+end of the sweep window; $\mathrm{LR}=3\times 10^{-4}$ drifts
+upward, $\mathrm{LR}/3$ shows occasional gradient spikes,
+$\mathrm{LR}/30$ is too small to make timely progress).
 
 \subsection{Stepped $d_{\text{head}}$ schedule}
 \label{sec:dhead}
@@ -311,13 +338,32 @@ d_{\text{head}}(d) \;=\;
 This bounds $n_{\text{heads}} = d / d_{\text{head}}$ above by $16$
 throughout, so the per-layer attention tensor never exceeds
 $B \times 16 \times T^2 \times \texttt{dtype}$ (here
-$\approx 0.5$ GB in \texttt{fp32}, $0.25$ GB in \texttt{bf16}).  At
-each $d_{\text{head}}$ doubling, the attention reshape changes and
-introduces a one-time function shock; we treat each such event as one
-extra grow event (subject to the same divergence guard).  Up to
-$d{=}2048$ there are at most four such transitions
+$\approx 0.5$ GB in \texttt{fp32}, $0.25$ GB in \texttt{bf16}).
+
+\paragraph{Transition mechanism.}  When a grow event crosses a
+$d_{\text{head}}$ bracket, the new $d_{\text{new}}$ is rounded up to
+the nearest multiple of the new $d_{\text{head}}$
+(\S\ref{sec:asymmetric-init}) so that
+$n_{\text{heads}}^{\text{new}} = d_{\text{new}}/d_{\text{head}}^{\text{new}}$
+is integer.  Weight matrices $W_q, W_k, W_v, W_o$ are
+\emph{stored} as $(d, d)$ Linears; the head decomposition is purely
+a \texttt{view} for the per-head reshape inside the attention
+forward pass.  Doubling $d_{\text{head}}$ therefore changes only the
+\emph{view} stride, not the stored weights: a column previously
+interpreted as the last entry of head $k$ becomes the first entry
+of head $\lfloor k/2 \rfloor$'s second half.  This re-partitioning
+is not function-preserving (the softmax-over-head-index splits
+differ), but the new $d$-columns produced by the grow are
+zero-padded with the asymmetric init of
+\S\ref{sec:asymmetric-init}, so the perturbation is the same kind
+of one-time shock as a regular grow event.  We treat the
+$d_{\text{head}}$ transition step as one extra grow event:
+$\texttt{in\_recovery}$ is set for $W$ steps and the divergence
+guard is \emph{not} reset (best-so-far is preserved across
+transitions, since the function shock typically pushes val above
+best).  Up to $d{=}2048$ there are at most four such transitions
 ($d_{\text{head}}{:}\,2{\to}4{\to}8{\to}16{\to}32$), contributing
-$\le 4$ recovery windows of $\sim 4000$ steps each, negligible
+$\le 4$ recovery windows of $\sim 4000$ steps each --- negligible
 compared with total training.
 
 \section{Empirical Results}
@@ -387,12 +433,11 @@ is in Appendix~\ref{app:trajectory}.
 \subsection{Width Detach --- Numerical Verification}
 
 We rerun the proof script \texttt{proofs/width\_detach.py} at
-$d \in \{64, 128, 256, 512\}$ and $g \in \{0.1, 0.05, 0.01\}$.  Empirical
-gradient distances scale as predicted ($O(g^2)$); typical errors are
-$10^{-5}$ to $10^{-7}$, several orders of magnitude below the gradient norm.
-% TODO: insert figure
-\textbf{[Figure 2 to be inserted: $\log\|\nabla L_{\mathrm{detach}} -
-\nabla L_{\mathrm{full}}\|$ vs $g$, log-log.]}
+$d \in \{64, 128, 256, 512\}$ and $g \in \{0.1, 0.05, 0.01\}$.
+Empirical gradient distances scale as predicted ($O(g^2)$); typical
+errors are $10^{-5}$ to $10^{-7}$, several orders of magnitude below
+the gradient norm.  See the script output for the exact per-$d$ /
+per-$g$ values.
 
 \subsection{Future ablations}
 \label{sec:ablations}
@@ -461,12 +506,12 @@ for the wall-optimal start $d$; we expect a sweet spot somewhere
 between $2$ and $64$ for hardware where kernel-launch overhead
 dominates more than ours.
 
-\paragraph{Stability past $d \approx 66$.}
-Beyond the best checkpoint at $d=66$ the val curve drifts upward by
-$\sim 0.2$ over several thousand steps.  The drift is slow (no
-single-step CE spikes; train CE remains in the $4.8$--$5.2$ band) but it
-does outpace recovery.  Diagnostics resumed from the $d=46$ checkpoint
-identify two contributors:
+\paragraph{Stability past $d \approx 66$ (early diagnostic).}
+An earlier configuration of this run (\texttt{bf16+AdamW8bit},
+$\eta=3{\times}10^{-4}$, fixed $d_{\text{head}}{=}2$) stalled near
+$d{=}66$: beyond the best checkpoint there, val drifted upward by
+$\sim 0.2$ over several thousand steps.  Diagnostics resumed from
+the $d=46$ checkpoint identified two contributors:
 \begin{itemize}
 \item \textbf{Mixed-precision optimizer state.}
   Holding everything else fixed and switching the forward to
@@ -544,10 +589,11 @@ Zenodo, DOI \href{https://doi.org/10.5281/zenodo.19454889}{10.5281/zenodo.194548
 
 \section{Schedule of grows in the main run}
 \label{app:trajectory}
-See \texttt{paper/RESULTS.md} for the full per-$d$ table.  The summary:
-the run touches $d \in \{2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28,
-30, 32, 34, 36, 38, 40, 42, 46, 50, 54, 58, 62, 66\}$ and reaches its best
-at $d=66$, step $116\,000$, FLOP $0.62\%$.
+See \texttt{paper/RESULTS.md} for the per-$d$ best-val table.  In
+summary, the main run touches $d \in \{2, 4, 6, 8, \ldots, 64, 72,
+80, \ldots, 256, 272, 288, \ldots, 496, 544\}$, growing by the
+$d_{\text{head}}$-aware rule of \S\ref{sec:asymmetric-init}, and
+reaches its best val $3.565$ at $d{=}496$ after $6.81$ wall-hours.
 
 \section{E2E baseline was not at plateau}
 \label{app:e2e-not-plateau}
