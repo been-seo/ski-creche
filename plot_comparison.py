@@ -49,8 +49,9 @@ def load(path):
                 best=best, grow=grow)
 
 
-adapt = load('/content/drive/MyDrive/ski/adaptive_v11.db')
-e2e   = load('/content/drive/MyDrive/ski/e2e_d544.db')
+import os
+adapt = load(os.environ.get('ADAPT_DB', 'adaptive.db'))
+e2e   = load(os.environ.get('E2E_DB', 'e2e_d544.db'))
 
 C_ADAPT = '#1f77b4'   # tableau blue
 C_E2E   = '#d62728'   # tableau red
@@ -124,8 +125,8 @@ for a in axes:
     a.spines['top'].set_visible(False)
     a.spines['right'].set_visible(False)
 
-plt.savefig('/content/drive/MyDrive/ski/ski-creche/scaleup/adapt_vs_e2e.pdf')
-plt.savefig('/content/drive/MyDrive/ski/ski-creche/scaleup/adapt_vs_e2e.png', dpi=200)
+plt.savefig('paper/adapt_vs_e2e.pdf')
+plt.savefig('paper/adapt_vs_e2e.png', dpi=200)
 print('saved adapt_vs_e2e.{pdf,png}')
 print(f"adapt best: val={min(adapt['val']):.4f} d={adapt['d'][bi]} "
       f"flop={adapt['flop'][bi]:.3e} wall={adapt['hour'][bi]:.2f}h")

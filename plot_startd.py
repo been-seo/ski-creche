@@ -41,9 +41,10 @@ def load(path):
         best.append(bv)
     return dict(val=val, flop=flop, hour=hour, best=best)
 
-adapt_d2  = load('/content/drive/MyDrive/ski/adaptive_v11.db')
-adapt_d64 = load('/content/drive/MyDrive/ski/adaptive_v12.db')
-e2e_d544  = load('/content/drive/MyDrive/ski/e2e_d544.db')
+import os
+adapt_d2  = load(os.environ.get('ADAPT_D2_DB',  'adaptive.db'))
+adapt_d64 = load(os.environ.get('ADAPT_D64_DB', 'adaptive_startd64.db'))
+e2e_d544  = load(os.environ.get('E2E_DB',       'e2e_d544.db'))
 
 C_D2  = '#1f77b4'  # blue
 C_D64 = '#9467bd'  # purple
@@ -90,8 +91,8 @@ for a in axes:
     a.spines['top'].set_visible(False)
     a.spines['right'].set_visible(False)
 
-plt.savefig('/content/drive/MyDrive/ski/ski-creche/scaleup/startd_ablation.pdf')
-plt.savefig('/content/drive/MyDrive/ski/ski-creche/scaleup/startd_ablation.png', dpi=200)
+plt.savefig('paper/startd_ablation.pdf')
+plt.savefig('paper/startd_ablation.png', dpi=200)
 print('saved startd_ablation.{pdf,png}')
 
 for name, r in [('d=2', adapt_d2), ('d=64', adapt_d64), ('E2E', e2e_d544)]:

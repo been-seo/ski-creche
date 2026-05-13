@@ -4,7 +4,7 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-c = sqlite3.connect('/content/drive/MyDrive/ski/adaptive_v11.db')
+c = sqlite3.connect(__import__('os').environ.get('ADAPT_DB', 'adaptive.db'))
 rows = c.execute("""
 SELECT d, MIN(val_ce), MAX(flops_used), AVG(val_ce) FROM log WHERE val_ce > 0
 GROUP BY d ORDER BY d""").fetchall()
@@ -32,5 +32,5 @@ ax[1].legend(loc='upper right', fontsize=8)
 ax[1].grid(alpha=0.3)
 
 plt.tight_layout()
-plt.savefig('/content/drive/MyDrive/ski/ski-creche/scaleup/v11_diminishing.pdf')
+plt.savefig('paper/v11_diminishing.pdf')
 print('Saved v11_diminishing.pdf')
