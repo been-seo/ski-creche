@@ -315,6 +315,7 @@ def main():
     eval_data = DataLoader('train', seed=99999)
     logger = Logger(DB_PATH)
 
+    wall_offset = 0.0
     if args.resume and os.path.exists(args.resume):
         ckpt = torch.load(args.resume, map_location=DEVICE, weights_only=False)
         model = Model(ckpt['d'], N_LAYERS, SEQ_LEN).to(DEVICE)
@@ -322,7 +323,10 @@ def main():
         global_step = ckpt['step']
         flops_used = ckpt.get('flops_used', 0)
         best = ckpt.get('best', float('inf'))
-        print(f'  Resumed: step={global_step}, d={ckpt["d"]}, flops={flops_used:.2e}')
+        wall_offset = ckpt.get('wall', 0.0)
+        # env var override (e.g. when ckpt was made without wall info)
+        wall_offset = float(os.environ.get('WALL_OFFSET', wall_offset))
+        print(f'  Resumed: step={global_step}, d={ckpt["d"]}, flops={flops_used:.2e}, wall_offset={wall_offset/3600:.2f}h')
     else:
         start_d = int(os.environ.get('START_D', 2))
         model = Model(start_d, N_LAYERS, SEQ_LEN).to(DEVICE)
@@ -339,7 +343,7 @@ def main():
         make_opt = lambda m: torch.optim.AdamW(m.parameters(), lr=LR, weight_decay=WD)
 
     opt = make_opt(model)
-    t0 = time.time()
+    t0 = time.time() - wall_offset
     run = os.environ.get('RUN_NAME', 'adaptive')
     last_d_eff = 0
     last_growth_step = -WINDOW_STEPS  # allow trigger from the start
@@ -464,7 +468,8 @@ def main():
             os.makedirs(CKPT_DIR, exist_ok=True)
             path = os.path.join(CKPT_DIR, f'{CKPT_PREFIX}step{global_step+1}.pt')
             torch.save({'model': model.state_dict(), 'step': global_step+1,
-                        'd': model.d, 'flops_used': flops_used, 'best': best},
+                        'd': model.d, 'flops_used': flops_used, 'best': best,
+                        'wall': time.time() - t0},
                        path)
             print(f'  [ckpt] saved {path}', flush=True)
 
