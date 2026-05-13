@@ -309,7 +309,9 @@ def main():
     print(f'Target FLOPs: {TARGET_FLOPS:.2e}')
     print(f'D_HEAD={D_HEAD}, max d={D_MAX}')
 
-    train_data = DataLoader('train', seed=0)
+    SEED = int(os.environ.get('SEED', 0))
+    torch.manual_seed(SEED)
+    train_data = DataLoader('train', seed=SEED)
     eval_data = DataLoader('train', seed=99999)
     logger = Logger(DB_PATH)
 
