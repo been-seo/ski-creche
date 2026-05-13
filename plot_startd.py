@@ -1,4 +1,4 @@
-"""Start-d ablation: d=2 (v11) vs d=64 (v12) vs fixed-d=544 E2E."""
+"""Start-d ablation: adaptive d=2 start vs adaptive d=64 start vs fixed-d=544 E2E."""
 import sqlite3
 import matplotlib
 matplotlib.use('Agg')
