@@ -135,11 +135,14 @@ shrinking $d$ (or starting small) gives a \emph{quadratic} per-FLOP win.
 \label{sec:method}
 
 \subsection{Architecture}
-22-layer transformer, sinusoidal PE, weight-tied input/output embedding,
-$d_{\text{head}} = 2$ so that any even $d$ admits a valid head decomposition.
-LayerNorm is replaced by ActiveLayerNorm
-(Theorem~\ref{thm:elasticity}) so that mean/var are computed over the first
-$d_{\text{active}}$ dimensions only.
+22-layer transformer, sinusoidal PE, weight-tied input/output
+embedding.  $d_{\text{head}}$ is determined as a stepped function of
+$d$ (\S\ref{sec:dhead}): $2$ at small $d$ to admit a valid head
+decomposition from $d{=}2$, increasing as $d$ grows so that
+$n_{\text{heads}} = d/d_{\text{head}}$ stays bounded.  LayerNorm is
+replaced by ActiveLayerNorm (Theorem~\ref{thm:elasticity}) so that
+mean/var are computed over the first $d_{\text{active}}$ dimensions
+only.
 
 \subsection{Adaptive Growth Trigger}
 \label{sec:trigger}
@@ -186,9 +189,14 @@ until it returns or sets a new best.
 \label{sec:asymmetric-init}
 
 \begin{equation}
-d_{\text{new}} \;=\; \max\!\bigl(d + 2,\; \lceil d \cdot 1.05 / 2\rceil \cdot 2\bigr)
-\quad \text{(multiplicative, even-rounded)}
+d_{\text{new}} \;=\; \mathrm{round}_{d_{\text{head}}(d_{\text{new}})}\!\Bigl(
+\max\!\bigl(d + 2,\; \lceil d \cdot 1.05 / 2\rceil \cdot 2\bigr)\Bigr)
 \end{equation}
+where $\mathrm{round}_k$ rounds up to the nearest multiple of $k$ so
+$d_{\text{new}}$ is divisible by the next-stage $d_{\text{head}}$
+(\S\ref{sec:dhead}).  The base growth is multiplicative
+($\times 1.05$, even-rounded) with an additive floor of $+2$ for
+small $d$.
 
 Naively zero-padding all weights at a grow event is exactly
 function-preserving when combined with ActiveLayerNorm
