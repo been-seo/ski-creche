@@ -139,35 +139,56 @@ class Block(nn.Module):
         h = h + self.ff2(F.gelu(self.ff1(self.ln2(h))))
         return h
 
-def _grow_linear(layer, new_in, new_out, noise_new_rows=0.0):
-    """Zero-pad growth with optional small noise on NEW ROWS only.
+def _grow_linear(layer, new_in, new_out, noise_new_rows=0.0, clone_new_rows=False):
+    """Grow a Linear from (old_out, old_in) to (new_out, new_in).
 
-    Why asymmetric:
-      Pure zero-pad + ActiveLayerNorm makes growth exactly function-preserving
-      (PAVING Thm.~35), but new attention heads' q-row stays at 0 forever:
-        q[new_row] = W_q[new_row,:] @ ln_x = 0  →  attn out=0  →  no
-        contribution to loss  →  ∂L/∂W_q[new_row,:] = 0.
-      Putting a tiny noise on the NEW ROWS of W_q,W_k,W_v breaks this dead loop:
-      now q,k,v at new heads are nonzero, attention output at new-head columns
-      is nonzero, and the GATE weights W_o[:, new_cols] (which we keep at 0) start
-      receiving real gradient.  Once W_o new cols are nonzero, gradient flows
-      back into the new q/k/v rows and the full new head trains normally.
-      Function approximately preserved while the gate is at 0.
+    Existing block (rows < old_out, cols < old_in) is copied verbatim.
+    Behaviour for the new rows (rows in [old_out, new_out)) is controlled
+    by `clone_new_rows` and `noise_new_rows`:
+
+      clone_new_rows=False (zero-pad + optional small noise):
+        New rows are zero except for noise_new_rows * sigma_w * N(0,1) on
+        the first old_in cols.  Used when the layer's output is gated
+        (W_o, ff2) and we want pure zero — set noise=0.  Used with noise
+        when the layer's output drives attention (W_q,W_k,W_v) and we
+        need a tiny signal to wake the gate up.
+
+      clone_new_rows=True (Net2Net):
+        For each new row i, pick a random source row s_i ~ U[0, old_out)
+        and copy that row's first old_in cols verbatim, plus
+        noise_new_rows * sigma_w * N(0,1) symmetry-breaking perturbation.
+        New heads start as duplicates of existing heads — they immediately
+        produce a meaningful attention pattern instead of random noise,
+        so the gradient signal at the gate (W_o new col) is the
+        gradient that the source head already receives.  After a few
+        steps the gradient noise breaks the symmetry.
+
+    Cols beyond old_in on existing rows are always zero (so the layer
+    does not read new input dimensions; that happens on the consumer
+    side by the next layer's grow).
     """
     old_w = layer.weight.data
     old_out, old_in = old_w.shape
     dev = old_w.device
     w = torch.zeros(new_out, new_in, device=dev)
     w[:old_out, :old_in] = old_w
-    if noise_new_rows > 0 and new_out > old_out:
-        scale = noise_new_rows
-        if old_w.numel() > 1:
-            scale = noise_new_rows * old_w.std().item()
-        w[old_out:, :old_in] = torch.randn(new_out - old_out, old_in, device=dev) * scale
+    n_new = new_out - old_out
+    if n_new > 0:
+        if clone_new_rows:
+            src = torch.randint(0, old_out, (n_new,), device=dev)
+            w[old_out:, :old_in] = old_w[src, :]
+        if noise_new_rows > 0:
+            scale = noise_new_rows
+            if old_w.numel() > 1:
+                scale = noise_new_rows * old_w.std().item()
+            w[old_out:, :old_in] += torch.randn(n_new, old_in, device=dev) * scale
     layer.weight = nn.Parameter(w)
     if layer.bias is not None:
         b = torch.zeros(new_out, device=dev)
         b[:old_out] = layer.bias.data
+        if clone_new_rows and n_new > 0:
+            src = torch.randint(0, old_out, (n_new,), device=dev)
+            b[old_out:] = layer.bias.data[src]
         layer.bias = nn.Parameter(b)
     layer.in_features, layer.out_features = new_in, new_out
 
@@ -193,13 +214,13 @@ def grow_block(block, new_d):
     _grow_active_ln(block.ln1, new_d)
     _grow_active_ln(block.ln2, new_d)
     # q/k/v: small noise on new rows (creates signal in new heads)
-    _grow_linear(block.W_q, new_d, new_d, noise_new_rows=ROW_NOISE)
-    _grow_linear(block.W_k, new_d, new_d, noise_new_rows=ROW_NOISE)
-    _grow_linear(block.W_v, new_d, new_d, noise_new_rows=ROW_NOISE)
+    _grow_linear(block.W_q, new_d, new_d, noise_new_rows=ROW_NOISE, clone_new_rows=True)
+    _grow_linear(block.W_k, new_d, new_d, noise_new_rows=ROW_NOISE, clone_new_rows=True)
+    _grow_linear(block.W_v, new_d, new_d, noise_new_rows=ROW_NOISE, clone_new_rows=True)
     # W_o: gate — keep all-zero new entries
     _grow_linear(block.W_o, new_d, new_d, noise_new_rows=0.0)
     # ff1 new rows = noise (creates signal in new intermediate dims)
-    _grow_linear(block.ff1, new_d, 4*new_d, noise_new_rows=ROW_NOISE)
+    _grow_linear(block.ff1, new_d, 4*new_d, noise_new_rows=ROW_NOISE, clone_new_rows=True)
     # ff2: gate — keep new rows AND new cols at zero
     _grow_linear(block.ff2, 4*new_d, new_d, noise_new_rows=0.0)
     block.d = new_d
@@ -323,9 +344,19 @@ def main():
         global_step = ckpt['step']
         flops_used = ckpt.get('flops_used', 0)
         best = ckpt.get('best', float('inf'))
-        wall_offset = ckpt.get('wall', 0.0)
-        # env var override (e.g. when ckpt was made without wall info)
-        wall_offset = float(os.environ.get('WALL_OFFSET', wall_offset))
+        # wall offset: prefer (a) value saved in ckpt, else (b) derive from
+        # ckpt-file mtime vs DB first-ts, else (c) WALL_OFFSET env var, else 0
+        wall_offset = ckpt.get('wall')
+        if wall_offset is None:
+            try:
+                conn = sqlite3.connect(DB_PATH)
+                first_ts = conn.execute('SELECT MIN(ts) FROM log').fetchone()[0]
+                conn.close()
+                if first_ts is not None:
+                    wall_offset = os.path.getmtime(args.resume) - first_ts
+            except Exception:
+                wall_offset = None
+        wall_offset = float(os.environ.get('WALL_OFFSET', wall_offset or 0.0))
         print(f'  Resumed: step={global_step}, d={ckpt["d"]}, flops={flops_used:.2e}, wall_offset={wall_offset/3600:.2f}h')
     else:
         start_d = int(os.environ.get('START_D', 2))
@@ -336,13 +367,20 @@ def main():
 
     print(f'Model: d={model.d}, {N_LAYERS}L, {model.param_count/1e6:.2f}M params')
 
+    # LR scales as eta(d) = LR * sqrt(d0 / d) per the |ΔL| ≤ η sqrt(N)
+    # scaling argument (§3.5).  d0 = start width.
+    LR_D0 = max(1, model.d)  # reference width
+    import math as _math
+    def lr_for(d):
+        return LR * _math.sqrt(LR_D0 / d)
+
     if USE_8BIT:
         import bitsandbytes as bnb
-        make_opt = lambda m: bnb.optim.AdamW8bit(m.parameters(), lr=LR, weight_decay=WD)
+        make_opt = lambda m, lr: bnb.optim.AdamW8bit(m.parameters(), lr=lr, weight_decay=WD)
     else:
-        make_opt = lambda m: torch.optim.AdamW(m.parameters(), lr=LR, weight_decay=WD)
+        make_opt = lambda m, lr: torch.optim.AdamW(m.parameters(), lr=lr, weight_decay=WD)
 
-    opt = make_opt(model)
+    opt = make_opt(model, lr_for(model.d))
     t0 = time.time() - wall_offset
     run = os.environ.get('RUN_NAME', 'adaptive')
     last_d_eff = 0
@@ -458,7 +496,8 @@ def main():
                       flush=True)
                 model.grow(new_d)
                 model = model.to(DEVICE)
-                opt = make_opt(model)
+                opt = make_opt(model, lr_for(model.d))
+                print(f'  lr={lr_for(model.d):.2e} (scaled by sqrt({LR_D0}/{model.d}))', flush=True)
                 last_growth_step = global_step
                 val_history = []  # reset history at new d
                 print(f'  params={model.param_count/1e6:.2f}M', flush=True)
