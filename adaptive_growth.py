@@ -46,11 +46,11 @@ DEFF_THRESHOLD = 0.30  # weight-rank ratio: grow only if d_eff_W/d > this
 ROW_NOISE = 1e-3  # asymmetric init: new rows of W_q/W_k/W_v/ff1 get this·σ_w noise
 VRAM_CAP_RATIO = 0.90  # stop growing when VRAM > this fraction
 
-CACHE_PATH = '/content/drive/MyDrive/ski/data_cache/fineweb_2.9B.pt'
+CACHE_PATH = os.environ.get('CACHE_PATH', 'data_cache/fineweb_2.9B.pt')
 EVAL_TOKENS = 1_000_000
-DB_PATH = '/content/drive/MyDrive/ski/adaptive_v11.db'
-CKPT_PREFIX = 'adapv11_'
-CKPT_DIR = '/content/drive/MyDrive/ski/ckpts'
+DB_PATH = os.environ.get('DB_PATH', 'adaptive.db')
+CKPT_PREFIX = 'adaptive_'
+CKPT_DIR = os.environ.get('CKPT_DIR', 'ckpts')
 EVAL_INTERVAL = 500
 EVAL_BATCHES = 20
 LOG_INTERVAL = 100
@@ -327,7 +327,7 @@ def main():
 
     opt = make_opt(model)
     t0 = time.time()
-    run = 'adaptive_v11'
+    run = os.environ.get('RUN_NAME', 'adaptive')
     last_d_eff = 0
     last_growth_step = -WINDOW_STEPS  # allow trigger from the start
     # val history at current d (reset on grow); list of (step, val)
